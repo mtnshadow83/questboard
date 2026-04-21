@@ -1,0 +1,1523 @@
+"""
+questboard — Agent-native project management tool.
+
+CLI for agents (context-cheap), web UI for humans (kanban on localhost).
+SQLite-backed, single-file, same ecosystem as Abadar and Desna.
+
+Usage:
+    python questboard.py <command> [args]
+    python questboard.py serve [--port 5151]
+"""
+
+import sqlite3
+import os
+import sys
+import argparse
+import datetime
+import json
+import textwrap
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "questboard.db")
+MESSAGEBOARD_DIR = os.path.expanduser("~/library/0-system/claude/messageboard")
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def get_db():
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA foreign_keys=ON")
+    return db
+
+
+def init_db():
+    db = get_db()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL DEFAULT 'agent' CHECK(role IN ('human', 'agent')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+
+        CREATE TABLE IF NOT EXISTS statuses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            display_order INTEGER NOT NULL DEFAULT 0,
+            is_closed INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            color TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            status_id INTEGER NOT NULL REFERENCES statuses(id),
+            assigned_to INTEGER REFERENCES users(id),
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+
+        CREATE TABLE IF NOT EXISTS ticket_labels (
+            ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+            label_id INTEGER NOT NULL REFERENCES labels(id),
+            PRIMARY KEY (ticket_id, label_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+            user_id INTEGER REFERENCES users(id),
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+            user_id INTEGER REFERENCES users(id),
+            action TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+    """)
+
+    # Seed default statuses if empty
+    existing = db.execute("SELECT COUNT(*) FROM statuses").fetchone()[0]
+    if existing == 0:
+        seed = [
+            ("queued", 0, 0),
+            ("in-progress", 1, 0),
+            ("blocked", 2, 0),
+            ("review", 3, 0),
+            ("done", 4, 1),
+            ("n/a", 5, 1),
+        ]
+        db.executemany("INSERT INTO statuses (name, display_order, is_closed) VALUES (?, ?, ?)", seed)
+
+    db.commit()
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def priority_dots(p):
+    if p <= 0: return ""
+    if p == 1: return "o"
+    if p == 2: return "oo"
+    if p == 3: return "ooo"
+    return "!" * min(p, 5)
+
+
+def resolve_user(db, name_or_id):
+    """Resolve a user by name or ID. Returns row or None."""
+    if name_or_id is None:
+        return None
+    try:
+        uid = int(name_or_id)
+        return db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    except ValueError:
+        return db.execute("SELECT * FROM users WHERE name=?", (name_or_id,)).fetchone()
+
+
+def resolve_status(db, name_or_id):
+    """Resolve a status by name or ID."""
+    try:
+        sid = int(name_or_id)
+        return db.execute("SELECT * FROM statuses WHERE id=?", (sid,)).fetchone()
+    except ValueError:
+        return db.execute("SELECT * FROM statuses WHERE name=?", (name_or_id,)).fetchone()
+
+
+def resolve_project(db, name_or_id):
+    """Resolve a project by name or ID."""
+    if name_or_id is None:
+        return None
+    try:
+        pid = int(name_or_id)
+        return db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    except ValueError:
+        return db.execute("SELECT * FROM projects WHERE name=?", (name_or_id,)).fetchone()
+
+
+def log_activity(db, ticket_id, user_id, action, detail=""):
+    db.execute(
+        "INSERT INTO activity_log (ticket_id, user_id, action, detail) VALUES (?, ?, ?, ?)",
+        (ticket_id, user_id, action, detail),
+    )
+
+
+def post_to_messageboard(message):
+    """Post a status change to the agent messageboard."""
+    if not os.path.isdir(MESSAGEBOARD_DIR):
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%dT%H%M%S")
+    filename = f"questboard-{ts}.md"
+    filepath = os.path.join(MESSAGEBOARD_DIR, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"# Questboard Update — {now()}\n\n{message}\n")
+
+
+def get_ticket_labels(db, ticket_id):
+    rows = db.execute("""
+        SELECT l.name FROM labels l
+        JOIN ticket_labels tl ON tl.label_id = l.id
+        WHERE tl.ticket_id = ?
+        ORDER BY l.name
+    """, (ticket_id,)).fetchall()
+    return [r["name"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# CLI Commands
+# ---------------------------------------------------------------------------
+
+def cmd_user_add(args):
+    db = get_db()
+    try:
+        db.execute("INSERT INTO users (name, role) VALUES (?, ?)", (args.name, args.role))
+        db.commit()
+        print(f"User: {args.name} ({args.role})")
+    except sqlite3.IntegrityError:
+        print(f"User '{args.name}' already exists")
+    db.close()
+
+
+def cmd_user_list(args):
+    db = get_db()
+    rows = db.execute("SELECT * FROM users ORDER BY name").fetchall()
+    for r in rows:
+        print(f"  {r['name']:20s} {r['role']}")
+    db.close()
+
+
+def cmd_project_add(args):
+    db = get_db()
+    desc = args.description or ""
+    try:
+        cur = db.execute("INSERT INTO projects (name, description) VALUES (?, ?)", (args.name, desc))
+        db.commit()
+        print(f"Project #{cur.lastrowid}: {args.name}")
+    except sqlite3.IntegrityError:
+        print(f"Project '{args.name}' already exists")
+    db.close()
+
+
+def cmd_project_list(args):
+    db = get_db()
+    show_archived = getattr(args, "archived", False)
+    if show_archived:
+        rows = db.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    else:
+        rows = db.execute("SELECT * FROM projects WHERE archived=0 ORDER BY name").fetchall()
+    for r in rows:
+        open_count = db.execute("""
+            SELECT COUNT(*) FROM tickets t
+            JOIN statuses s ON s.id = t.status_id
+            WHERE t.project_id = ? AND s.is_closed = 0
+        """, (r["id"],)).fetchone()[0]
+        arc = " [archived]" if r["archived"] else ""
+        print(f"  #{r['id']:3d} {r['name']:30s} ({open_count} open){arc}")
+    db.close()
+
+
+def cmd_project_archive(args):
+    db = get_db()
+    proj = resolve_project(db, args.project)
+    if not proj:
+        print(f"Project not found: {args.project}")
+        db.close()
+        return
+    db.execute("UPDATE projects SET archived=1 WHERE id=?", (proj["id"],))
+    db.commit()
+    print(f"Archived: {proj['name']}")
+    db.close()
+
+
+def cmd_add(args):
+    db = get_db()
+    proj = resolve_project(db, args.project)
+    if not proj:
+        print(f"Project not found: {args.project}")
+        db.close()
+        return
+
+    # Default status is queued (display_order 0)
+    status = db.execute("SELECT * FROM statuses ORDER BY display_order LIMIT 1").fetchone()
+
+    assignee = resolve_user(db, args.assign) if args.assign else None
+    creator = resolve_user(db, args.creator) if args.creator else None
+
+    cur = db.execute(
+        "INSERT INTO tickets (project_id, status_id, assigned_to, title, description, priority, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (proj["id"], status["id"], assignee["id"] if assignee else None, args.title,
+         args.description or "", args.priority or 0, creator["id"] if creator else None),
+    )
+    ticket_id = cur.lastrowid
+
+    log_activity(db, ticket_id, creator["id"] if creator else None, "created", args.title)
+
+    # Add labels
+    if args.label:
+        for lname in args.label:
+            label = db.execute("SELECT * FROM labels WHERE name=?", (lname,)).fetchone()
+            if not label:
+                lcur = db.execute("INSERT INTO labels (name) VALUES (?)", (lname,))
+                label_id = lcur.lastrowid
+            else:
+                label_id = label["id"]
+            try:
+                db.execute("INSERT INTO ticket_labels (ticket_id, label_id) VALUES (?, ?)", (ticket_id, label_id))
+            except sqlite3.IntegrityError:
+                pass
+
+    db.commit()
+
+    assignee_str = f" @{assignee['name']}" if assignee else ""
+    pri_str = f" {priority_dots(args.priority or 0)}" if args.priority else ""
+    print(f"#{ticket_id} {args.title} [{status['name']}]{assignee_str}{pri_str}")
+    db.close()
+
+
+def cmd_list(args):
+    db = get_db()
+    query = """
+        SELECT t.*, s.name as status_name, s.is_closed,
+               u.name as assignee_name, p.name as project_name
+        FROM tickets t
+        JOIN statuses s ON s.id = t.status_id
+        LEFT JOIN users u ON u.id = t.assigned_to
+        JOIN projects p ON p.id = t.project_id
+        WHERE 1=1
+    """
+    params = []
+
+    if args.project:
+        proj = resolve_project(db, args.project)
+        if proj:
+            query += " AND t.project_id = ?"
+            params.append(proj["id"])
+
+    if args.status:
+        st = resolve_status(db, args.status)
+        if st:
+            query += " AND t.status_id = ?"
+            params.append(st["id"])
+
+    if args.assign:
+        user = resolve_user(db, args.assign)
+        if user:
+            query += " AND t.assigned_to = ?"
+            params.append(user["id"])
+
+    if args.label:
+        query += " AND t.id IN (SELECT tl.ticket_id FROM ticket_labels tl JOIN labels l ON l.id = tl.label_id WHERE l.name = ?)"
+        params.append(args.label)
+
+    if not args.all:
+        query += " AND s.is_closed = 0"
+
+    query += " ORDER BY t.priority DESC, t.id"
+
+    rows = db.execute(query, params).fetchall()
+    for r in rows:
+        labels = get_ticket_labels(db, r["id"])
+        assignee = f"@{r['assignee_name']}" if r["assignee_name"] else ""
+        label_str = " ".join(labels)
+        pri = priority_dots(r["priority"])
+        done_mark = "x" if r["is_closed"] else " "
+        print(f"  [{done_mark}] #{r['id']:4d} {r['title']:40s} {assignee:12s} {r['status_name']:14s} {label_str} {pri}")
+    if not rows:
+        print("  (no tickets)")
+    db.close()
+
+
+def cmd_show(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    proj = db.execute("SELECT * FROM projects WHERE id=?", (ticket["project_id"],)).fetchone()
+    status = db.execute("SELECT * FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
+    assignee = db.execute("SELECT * FROM users WHERE id=?", (ticket["assigned_to"],)).fetchone() if ticket["assigned_to"] else None
+    creator = db.execute("SELECT * FROM users WHERE id=?", (ticket["created_by"],)).fetchone() if ticket["created_by"] else None
+    labels = get_ticket_labels(db, ticket["id"])
+
+    print(f"#{ticket['id']} {ticket['title']}")
+    print(f"  Project:  {proj['name']} (#{proj['id']})")
+    print(f"  Status:   {status['name']}")
+    if assignee:
+        print(f"  Assigned: {assignee['name']}")
+    print(f"  Priority: {ticket['priority']} {priority_dots(ticket['priority'])}")
+    if labels:
+        print(f"  Labels:   {', '.join(labels)}")
+    if creator:
+        print(f"  Created:  {ticket['created_at']} by {creator['name']}")
+    else:
+        print(f"  Created:  {ticket['created_at']}")
+    if ticket["description"]:
+        print(f"  ---")
+        print(f"  {ticket['description']}")
+
+    # Comments
+    comments = db.execute("""
+        SELECT c.*, u.name as user_name FROM comments c
+        LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.ticket_id = ? ORDER BY c.created_at
+    """, (ticket["id"],)).fetchall()
+    if comments:
+        print(f"  ---")
+        for c in comments:
+            who = c["user_name"] or "system"
+            print(f"  [{c['created_at']}] {who}: {c['body']}")
+
+    db.close()
+
+
+def cmd_status(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    new_status = resolve_status(db, args.status_name)
+    if not new_status:
+        print(f"Status not found: {args.status_name}")
+        db.close()
+        return
+
+    old_status = db.execute("SELECT name FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
+    db.execute("UPDATE tickets SET status_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+               (new_status["id"], args.ticket_id))
+    log_activity(db, args.ticket_id, None, "status", f"{old_status['name']} -> {new_status['name']}")
+    db.commit()
+
+    print(f"#{args.ticket_id} -> {new_status['name']}")
+    post_to_messageboard(f"Ticket #{args.ticket_id} ({ticket['title']}): {old_status['name']} -> {new_status['name']}")
+    db.close()
+
+
+def cmd_assign(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    user = resolve_user(db, args.user)
+    if not user:
+        print(f"User not found: {args.user}")
+        db.close()
+        return
+
+    db.execute("UPDATE tickets SET assigned_to=?, updated_at=datetime('now','localtime') WHERE id=?",
+               (user["id"], args.ticket_id))
+    log_activity(db, args.ticket_id, user["id"], "assigned", f"-> @{user['name']}")
+    db.commit()
+
+    print(f"#{args.ticket_id} -> @{user['name']}")
+    post_to_messageboard(f"Ticket #{args.ticket_id} ({ticket['title']}): assigned to @{user['name']}")
+    db.close()
+
+
+def cmd_move(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    proj = resolve_project(db, args.project)
+    if not proj:
+        print(f"Project not found: {args.project}")
+        db.close()
+        return
+
+    db.execute("UPDATE tickets SET project_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+               (proj["id"], args.ticket_id))
+    log_activity(db, args.ticket_id, None, "moved", f"-> {proj['name']} (#{proj['id']})")
+    db.commit()
+
+    print(f"#{args.ticket_id} moved to {proj['name']} (#{proj['id']})")
+    db.close()
+
+
+def cmd_done(args):
+    db = get_db()
+    done_status = db.execute("SELECT * FROM statuses WHERE is_closed=1 ORDER BY display_order LIMIT 1").fetchone()
+    if not done_status:
+        print("No closed status defined")
+        db.close()
+        return
+
+    for tid in args.ticket_ids:
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+        if not ticket:
+            print(f"Ticket not found: {tid}")
+            continue
+        old_status = db.execute("SELECT name FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
+        db.execute("UPDATE tickets SET status_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (done_status["id"], tid))
+        log_activity(db, tid, None, "status", f"{old_status['name']} -> {done_status['name']}")
+        print(f"#{tid} -> {done_status['name']}")
+        post_to_messageboard(f"Ticket #{tid} ({ticket['title']}): {old_status['name']} -> {done_status['name']}")
+
+    db.commit()
+    db.close()
+
+
+def cmd_block(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    blocked_status = resolve_status(db, "blocked")
+    if not blocked_status:
+        print("No 'blocked' status found")
+        db.close()
+        return
+
+    old_status = db.execute("SELECT name FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
+    db.execute("UPDATE tickets SET status_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+               (blocked_status["id"], args.ticket_id))
+    log_activity(db, args.ticket_id, None, "status", f"{old_status['name']} -> blocked")
+
+    if args.reason:
+        db.execute("INSERT INTO comments (ticket_id, body) VALUES (?, ?)", (args.ticket_id, args.reason))
+        log_activity(db, args.ticket_id, None, "comment", args.reason)
+
+    db.commit()
+    print(f"#{args.ticket_id} -> blocked")
+    if args.reason:
+        print(f"  Comment: {args.reason}")
+    post_to_messageboard(f"Ticket #{args.ticket_id} ({ticket['title']}): blocked" +
+                         (f" — {args.reason}" if args.reason else ""))
+    db.close()
+
+
+def cmd_comment(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    user = resolve_user(db, args.user) if args.user else None
+    db.execute("INSERT INTO comments (ticket_id, user_id, body) VALUES (?, ?, ?)",
+               (args.ticket_id, user["id"] if user else None, args.text))
+    log_activity(db, args.ticket_id, user["id"] if user else None, "comment", args.text)
+    db.commit()
+    print(f"Comment added to #{args.ticket_id}")
+    db.close()
+
+
+def cmd_label(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    label = db.execute("SELECT * FROM labels WHERE name=?", (args.label_name,)).fetchone()
+    if not label:
+        cur = db.execute("INSERT INTO labels (name) VALUES (?)", (args.label_name,))
+        label_id = cur.lastrowid
+    else:
+        label_id = label["id"]
+
+    try:
+        db.execute("INSERT INTO ticket_labels (ticket_id, label_id) VALUES (?, ?)", (args.ticket_id, label_id))
+        log_activity(db, args.ticket_id, None, "label", f"+{args.label_name}")
+        db.commit()
+        print(f"Label {args.label_name} added to #{args.ticket_id}")
+    except sqlite3.IntegrityError:
+        print(f"#{args.ticket_id} already has label {args.label_name}")
+    db.close()
+
+
+def cmd_unlabel(args):
+    db = get_db()
+    label = db.execute("SELECT * FROM labels WHERE name=?", (args.label_name,)).fetchone()
+    if not label:
+        print(f"Label not found: {args.label_name}")
+        db.close()
+        return
+    db.execute("DELETE FROM ticket_labels WHERE ticket_id=? AND label_id=?", (args.ticket_id, label["id"]))
+    log_activity(db, args.ticket_id, None, "label", f"-{args.label_name}")
+    db.commit()
+    print(f"Label {args.label_name} removed from #{args.ticket_id}")
+    db.close()
+
+
+def cmd_label_add(args):
+    db = get_db()
+    try:
+        db.execute("INSERT INTO labels (name, color) VALUES (?, ?)", (args.name, args.color or ""))
+        db.commit()
+        print(f"Label: {args.name}")
+    except sqlite3.IntegrityError:
+        print(f"Label '{args.name}' already exists")
+    db.close()
+
+
+def cmd_label_list(args):
+    db = get_db()
+    rows = db.execute("SELECT * FROM labels ORDER BY name").fetchall()
+    for r in rows:
+        color = f"  ({r['color']})" if r["color"] else ""
+        print(f"  {r['name']}{color}")
+    db.close()
+
+
+def cmd_status_list(args):
+    db = get_db()
+    rows = db.execute("SELECT * FROM statuses ORDER BY display_order").fetchall()
+    for r in rows:
+        closed = " (closed)" if r["is_closed"] else ""
+        print(f"  {r['display_order']}: {r['name']}{closed}")
+    db.close()
+
+
+def cmd_status_add(args):
+    db = get_db()
+    closed = 1 if args.closed else 0
+    try:
+        db.execute("INSERT INTO statuses (name, display_order, is_closed) VALUES (?, ?, ?)",
+                   (args.name, args.order, closed))
+        db.commit()
+        print(f"Status added: {args.name} (order {args.order})")
+    except sqlite3.IntegrityError:
+        print(f"Status '{args.name}' already exists")
+    db.close()
+
+
+def cmd_status_rename(args):
+    db = get_db()
+    result = db.execute("UPDATE statuses SET name=? WHERE name=?", (args.new_name, args.old_name))
+    if result.rowcount == 0:
+        print(f"Status not found: {args.old_name}")
+    else:
+        db.commit()
+        print(f"Status renamed: {args.old_name} -> {args.new_name}")
+    db.close()
+
+
+def cmd_status_reorder(args):
+    db = get_db()
+    result = db.execute("UPDATE statuses SET display_order=? WHERE name=?", (args.order, args.name))
+    if result.rowcount == 0:
+        print(f"Status not found: {args.name}")
+    else:
+        db.commit()
+        print(f"Status reorder: {args.name} -> position {args.order}")
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Web UI (Flask)
+# ---------------------------------------------------------------------------
+
+def cmd_serve(args):
+    from flask import Flask, render_template_string, request, redirect, url_for
+
+    app = Flask(__name__)
+    port = args.port or 5151
+
+    LAYOUT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Questboard{% if subtitle %} — {{ subtitle }}{% endif %}</title>
+<style>
+:root {
+    --bg: #1a1a2e;
+    --bg2: #16213e;
+    --bg3: #0f3460;
+    --fg: #e0e0e0;
+    --fg2: #a0a0b0;
+    --accent: #e94560;
+    --accent2: #533483;
+    --green: #4a7c59;
+    --yellow: #d4a017;
+    --red: #cc3333;
+    --blue: #3a86ff;
+    --border: #2a2a4a;
+    --card: #16213e;
+    --card-hover: #1a2744;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.topbar {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+}
+.topbar h1 { font-size: 18px; color: var(--accent); font-weight: 700; letter-spacing: 1px; }
+.topbar nav { display: flex; gap: 16px; }
+.topbar nav a { color: var(--fg2); font-size: 14px; padding: 4px 8px; border-radius: 4px; }
+.topbar nav a:hover, .topbar nav a.active { color: var(--fg); background: var(--bg3); text-decoration: none; }
+
+.filters {
+    padding: 12px 24px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.filters select, .filters input {
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+}
+.filters label { color: var(--fg2); font-size: 13px; }
+
+.kanban {
+    display: flex;
+    gap: 16px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    min-height: calc(100vh - 120px);
+    align-items: flex-start;
+}
+.kanban-col {
+    min-width: 280px;
+    max-width: 320px;
+    flex: 1;
+    background: var(--bg2);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+}
+.kanban-col-header {
+    padding: 12px 16px;
+    font-weight: 600;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--fg2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.kanban-col-header .count {
+    background: var(--bg);
+    color: var(--fg2);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+.kanban-cards { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+
+.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.card:hover { background: var(--card-hover); border-color: var(--accent2); }
+.card-id { color: var(--fg2); font-size: 11px; }
+.card-title { font-size: 14px; margin: 4px 0 8px 0; line-height: 1.3; }
+.card-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.card-assignee { font-size: 12px; color: var(--blue); }
+.card-priority { font-size: 12px; color: var(--yellow); font-weight: 700; }
+.card-label {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--accent2);
+    color: var(--fg);
+}
+.card-project { font-size: 11px; color: var(--fg2); }
+
+/* Ticket detail */
+.ticket-detail {
+    max-width: 800px;
+    margin: 24px auto;
+    padding: 0 24px;
+}
+.ticket-detail h1 { font-size: 22px; margin-bottom: 16px; }
+.ticket-detail .meta-grid {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 8px 16px;
+    margin-bottom: 20px;
+    font-size: 14px;
+}
+.ticket-detail .meta-grid dt { color: var(--fg2); }
+.ticket-detail .meta-grid dd { color: var(--fg); }
+.ticket-detail .description {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    margin-bottom: 20px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+.ticket-detail .comment {
+    border-left: 3px solid var(--accent2);
+    padding: 8px 16px;
+    margin-bottom: 12px;
+    background: var(--bg2);
+    border-radius: 0 6px 6px 0;
+}
+.ticket-detail .comment .who { color: var(--blue); font-weight: 600; font-size: 13px; }
+.ticket-detail .comment .when { color: var(--fg2); font-size: 12px; margin-left: 8px; }
+.ticket-detail .comment .body { margin-top: 4px; font-size: 14px; line-height: 1.5; }
+
+.activity-log { margin-top: 20px; }
+.activity-log table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.activity-log th { text-align: left; color: var(--fg2); padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.activity-log td { padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--fg); }
+
+/* List view */
+.list-view { padding: 20px 24px; }
+.list-view table { width: 100%; border-collapse: collapse; }
+.list-view th { text-align: left; color: var(--fg2); padding: 8px 12px; border-bottom: 2px solid var(--border); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+.list-view td { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+.list-view tr:hover { background: var(--bg2); }
+
+.status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.status-queued { background: var(--bg3); color: var(--fg); }
+.status-in-progress { background: var(--blue); color: #fff; }
+.status-blocked { background: var(--red); color: #fff; }
+.status-review { background: var(--yellow); color: #000; }
+.status-done { background: var(--green); color: #fff; }
+.status-na { background: var(--fg2); color: var(--bg); }
+
+/* Edit forms */
+.edit-form {
+    max-width: 600px;
+    margin: 24px auto;
+    padding: 0 24px;
+}
+.edit-form .field { margin-bottom: 16px; }
+.edit-form label { display: block; color: var(--fg2); font-size: 13px; margin-bottom: 4px; }
+.edit-form input, .edit-form select, .edit-form textarea {
+    width: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-size: 14px;
+}
+.edit-form textarea { min-height: 100px; resize: vertical; }
+.edit-form button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 8px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+}
+.edit-form button:hover { opacity: 0.9; }
+</style>
+</head>
+<body>
+<div class="topbar">
+    <h1>QUESTBOARD</h1>
+    <nav>
+        <a href="/" class="{{ 'active' if view == 'kanban' else '' }}">Kanban</a>
+        <a href="/list" class="{{ 'active' if view == 'list' else '' }}">List</a>
+    </nav>
+</div>
+{% block content %}{% endblock %}
+</body>
+</html>"""
+
+    KANBAN_PAGE = """{% extends layout %}
+{% block content %}
+<form class="filters" method="get">
+    <label>Project:</label>
+    <select name="project" onchange="this.form.submit()">
+        <option value="">All Projects</option>
+        {% for p in projects %}
+        <option value="{{ p.id }}" {{ 'selected' if p.id == current_project }}>{{ p.name }}</option>
+        {% endfor %}
+    </select>
+    <label>Assignee:</label>
+    <select name="assignee" onchange="this.form.submit()">
+        <option value="">Everyone</option>
+        {% for u in users %}
+        <option value="{{ u.id }}" {{ 'selected' if u.id == current_assignee }}>{{ u.name }}</option>
+        {% endfor %}
+    </select>
+    <label>Label:</label>
+    <select name="label" onchange="this.form.submit()">
+        <option value="">Any</option>
+        {% for l in labels %}
+        <option value="{{ l.name }}" {{ 'selected' if l.name == current_label }}>{{ l.name }}</option>
+        {% endfor %}
+    </select>
+</form>
+<div class="kanban">
+    {% for status in statuses %}
+    <div class="kanban-col">
+        <div class="kanban-col-header">
+            {{ status.name }}
+            <span class="count">{{ columns[status.id]|length }}</span>
+        </div>
+        <div class="kanban-cards">
+            {% for t in columns[status.id] %}
+            <a href="/ticket/{{ t.id }}" style="text-decoration:none;color:inherit;">
+            <div class="card">
+                <div class="card-id">#{{ t.id }}{% if t.project_name %} <span class="card-project">{{ t.project_name }}</span>{% endif %}</div>
+                <div class="card-title">{{ t.title }}</div>
+                <div class="card-meta">
+                    {% if t.assignee_name %}<span class="card-assignee">@{{ t.assignee_name }}</span>{% endif %}
+                    {% if t.priority > 0 %}<span class="card-priority">{{ '!' * t.priority }}</span>{% endif %}
+                    {% for l in t.labels %}<span class="card-label" {% if l.color %}style="background:{{ l.color }}"{% endif %}>{{ l.name }}</span>{% endfor %}
+                </div>
+            </div>
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}"""
+
+    LIST_PAGE = """{% extends layout %}
+{% block content %}
+<form class="filters" method="get">
+    <label>Project:</label>
+    <select name="project" onchange="this.form.submit()">
+        <option value="">All Projects</option>
+        {% for p in projects %}
+        <option value="{{ p.id }}" {{ 'selected' if p.id == current_project }}>{{ p.name }}</option>
+        {% endfor %}
+    </select>
+    <label>Assignee:</label>
+    <select name="assignee" onchange="this.form.submit()">
+        <option value="">Everyone</option>
+        {% for u in users %}
+        <option value="{{ u.id }}" {{ 'selected' if u.id == current_assignee }}>{{ u.name }}</option>
+        {% endfor %}
+    </select>
+    <label>Show closed:</label>
+    <input type="checkbox" name="show_closed" {{ 'checked' if show_closed }} onchange="this.form.submit()" style="width:auto;">
+</form>
+<div class="list-view">
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Title</th>
+            <th>Project</th>
+            <th>Status</th>
+            <th>Assignee</th>
+            <th>Priority</th>
+            <th>Labels</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for t in tickets %}
+        <tr>
+            <td><a href="/ticket/{{ t.id }}">#{{ t.id }}</a></td>
+            <td><a href="/ticket/{{ t.id }}">{{ t.title }}</a></td>
+            <td>{{ t.project_name }}</td>
+            <td><span class="status-badge status-{{ t.status_name|replace(' ', '-') }}">{{ t.status_name }}</span></td>
+            <td>{% if t.assignee_name %}@{{ t.assignee_name }}{% endif %}</td>
+            <td>{{ '!' * t.priority if t.priority > 0 else '' }}</td>
+            <td>{% for l in t.labels %}<span class="card-label" {% if l.color %}style="background:{{ l.color }}"{% endif %}>{{ l.name }}</span> {% endfor %}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</div>
+{% endblock %}"""
+
+    TICKET_PAGE = """{% extends layout %}
+{% block content %}
+<div class="ticket-detail">
+    <h1>#{{ ticket.id }} {{ ticket.title }}</h1>
+    <dl class="meta-grid">
+        <dt>Project</dt><dd><a href="/?project={{ ticket.project_id }}">{{ project_name }}</a></dd>
+        <dt>Status</dt><dd>
+            <form method="post" action="/ticket/{{ ticket.id }}/status" style="display:inline;">
+                <select name="status_id" onchange="this.form.submit()">
+                    {% for s in statuses %}
+                    <option value="{{ s.id }}" {{ 'selected' if s.id == ticket.status_id }}>{{ s.name }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+        </dd>
+        <dt>Assigned to</dt><dd>
+            <form method="post" action="/ticket/{{ ticket.id }}/assign" style="display:inline;">
+                <select name="user_id" onchange="this.form.submit()">
+                    <option value="">Unassigned</option>
+                    {% for u in users %}
+                    <option value="{{ u.id }}" {{ 'selected' if ticket.assigned_to == u.id }}>{{ u.name }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+        </dd>
+        <dt>Priority</dt><dd>{{ ticket.priority }} {{ '!' * ticket.priority if ticket.priority > 0 else '' }}</dd>
+        <dt>Labels</dt><dd>{% for l in labels %}{{ l }} {% endfor %}</dd>
+        <dt>Created</dt><dd>{{ ticket.created_at }}{% if creator_name %} by {{ creator_name }}{% endif %}</dd>
+        <dt>Updated</dt><dd>{{ ticket.updated_at }}</dd>
+    </dl>
+
+    {% if ticket.description %}
+    <div class="description">{{ ticket.description }}</div>
+    {% endif %}
+
+    <h3 style="color:var(--fg2);font-size:14px;margin-bottom:12px;">Comments</h3>
+    {% for c in comments %}
+    <div class="comment">
+        <span class="who">{{ c.user_name or 'system' }}</span>
+        <span class="when">{{ c.created_at }}</span>
+        <div class="body">{{ c.body }}</div>
+    </div>
+    {% endfor %}
+
+    <form method="post" action="/ticket/{{ ticket.id }}/comment" style="margin-top:16px;">
+        <textarea name="body" placeholder="Add a comment..." style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:8px;min-height:60px;resize:vertical;"></textarea>
+        <button type="submit" style="margin-top:8px;background:var(--accent);color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Comment</button>
+    </form>
+
+    <div class="activity-log">
+        <h3 style="color:var(--fg2);font-size:14px;margin:20px 0 12px 0;">Activity Log</h3>
+        <table>
+            <thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Detail</th></tr></thead>
+            <tbody>
+                {% for a in activity %}
+                <tr>
+                    <td>{{ a.created_at }}</td>
+                    <td>{{ a.user_name or 'system' }}</td>
+                    <td>{{ a.action }}</td>
+                    <td>{{ a.detail }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}"""
+
+    from jinja2 import BaseLoader, TemplateNotFound
+
+    class InlineLoader(BaseLoader):
+        def __init__(self, templates):
+            self.templates = templates
+        def get_source(self, environment, template):
+            if template in self.templates:
+                return self.templates[template], template, lambda: True
+            raise TemplateNotFound(template)
+
+    app.jinja_loader = InlineLoader({
+        "layout": LAYOUT,
+        "kanban.html": KANBAN_PAGE,
+        "list.html": LIST_PAGE,
+        "ticket.html": TICKET_PAGE,
+    })
+
+    def get_filter_context(req):
+        db = get_db()
+        projects = db.execute("SELECT * FROM projects WHERE archived=0 ORDER BY name").fetchall()
+        users = db.execute("SELECT * FROM users ORDER BY name").fetchall()
+        labels = db.execute("SELECT * FROM labels ORDER BY name").fetchall()
+
+        current_project = int(req.args.get("project", 0) or 0)
+        current_assignee = int(req.args.get("assignee", 0) or 0)
+        current_label = req.args.get("label", "")
+
+        return db, projects, users, labels, current_project, current_assignee, current_label
+
+    def build_ticket_query(current_project, current_assignee, current_label, show_closed=False):
+        query = """
+            SELECT t.*, s.name as status_name, s.is_closed, s.display_order,
+                   u.name as assignee_name, p.name as project_name
+            FROM tickets t
+            JOIN statuses s ON s.id = t.status_id
+            LEFT JOIN users u ON u.id = t.assigned_to
+            JOIN projects p ON p.id = t.project_id
+            WHERE p.archived = 0
+        """
+        params = []
+        if current_project:
+            query += " AND t.project_id = ?"
+            params.append(current_project)
+        if current_assignee:
+            query += " AND t.assigned_to = ?"
+            params.append(current_assignee)
+        if current_label:
+            query += " AND t.id IN (SELECT tl.ticket_id FROM ticket_labels tl JOIN labels l ON l.id = tl.label_id WHERE l.name = ?)"
+            params.append(current_label)
+        if not show_closed:
+            query += " AND s.is_closed = 0"
+        query += " ORDER BY t.priority DESC, t.id"
+        return query, params
+
+    @app.route("/")
+    def kanban():
+        db, projects, users, labels, cp, ca, cl = get_filter_context(request)
+        statuses = db.execute("SELECT * FROM statuses WHERE is_closed=0 ORDER BY display_order").fetchall()
+        query, params = build_ticket_query(cp, ca, cl, show_closed=False)
+        tickets = db.execute(query, params).fetchall()
+
+        # Attach labels to tickets
+        enriched = []
+        for t in tickets:
+            t_labels = db.execute("""
+                SELECT l.name, l.color FROM labels l
+                JOIN ticket_labels tl ON tl.label_id = l.id WHERE tl.ticket_id = ?
+            """, (t["id"],)).fetchall()
+            enriched.append({**dict(t), "labels": [dict(l) for l in t_labels]})
+
+        columns = {s["id"]: [] for s in statuses}
+        for t in enriched:
+            if t["status_id"] in columns:
+                columns[t["status_id"]].append(t)
+
+        db.close()
+        return render_template_string(
+            "{% extends 'kanban.html' %}",
+            layout="layout",
+            view="kanban",
+            subtitle="Kanban",
+            statuses=statuses,
+            columns=columns,
+            projects=projects,
+            users=users,
+            labels=labels,
+            current_project=cp,
+            current_assignee=ca,
+            current_label=cl,
+        )
+
+    @app.route("/list")
+    def list_view():
+        db, projects, users, labels, cp, ca, cl = get_filter_context(request)
+        show_closed = request.args.get("show_closed") == "on"
+        query, params = build_ticket_query(cp, ca, cl, show_closed)
+        tickets = db.execute(query, params).fetchall()
+
+        enriched = []
+        for t in tickets:
+            t_labels = db.execute("""
+                SELECT l.name, l.color FROM labels l
+                JOIN ticket_labels tl ON tl.label_id = l.id WHERE tl.ticket_id = ?
+            """, (t["id"],)).fetchall()
+            enriched.append({**dict(t), "labels": [dict(l) for l in t_labels]})
+
+        db.close()
+        return render_template_string(
+            "{% extends 'list.html' %}",
+            layout="layout",
+            view="list",
+            subtitle="List",
+            tickets=enriched,
+            projects=projects,
+            users=users,
+            labels=labels,
+            current_project=cp,
+            current_assignee=ca,
+            current_label=cl,
+            show_closed=show_closed,
+        )
+
+    @app.route("/ticket/<int:ticket_id>")
+    def ticket_detail(ticket_id):
+        db = get_db()
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not ticket:
+            return "Ticket not found", 404
+
+        project = db.execute("SELECT * FROM projects WHERE id=?", (ticket["project_id"],)).fetchone()
+        statuses = db.execute("SELECT * FROM statuses ORDER BY display_order").fetchall()
+        users = db.execute("SELECT * FROM users ORDER BY name").fetchall()
+        labels = get_ticket_labels(db, ticket_id)
+        creator = db.execute("SELECT name FROM users WHERE id=?", (ticket["created_by"],)).fetchone() if ticket["created_by"] else None
+
+        comments = db.execute("""
+            SELECT c.*, u.name as user_name FROM comments c
+            LEFT JOIN users u ON u.id = c.user_id
+            WHERE c.ticket_id = ? ORDER BY c.created_at
+        """, (ticket_id,)).fetchall()
+
+        activity = db.execute("""
+            SELECT a.*, u.name as user_name FROM activity_log a
+            LEFT JOIN users u ON u.id = a.user_id
+            WHERE a.ticket_id = ? ORDER BY a.created_at
+        """, (ticket_id,)).fetchall()
+
+        db.close()
+        return render_template_string(
+            "{% extends 'ticket.html' %}",
+            layout="layout",
+            view="ticket",
+            subtitle=f"#{ticket_id}",
+            ticket=ticket,
+            project_name=project["name"],
+            statuses=statuses,
+            users=users,
+            labels=labels,
+            creator_name=creator["name"] if creator else None,
+            comments=comments,
+            activity=activity,
+        )
+
+    @app.route("/ticket/<int:ticket_id>/status", methods=["POST"])
+    def update_ticket_status(ticket_id):
+        db = get_db()
+        new_status_id = int(request.form["status_id"])
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        old_status = db.execute("SELECT name FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
+        new_status = db.execute("SELECT name FROM statuses WHERE id=?", (new_status_id,)).fetchone()
+        db.execute("UPDATE tickets SET status_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (new_status_id, ticket_id))
+        log_activity(db, ticket_id, None, "status", f"{old_status['name']} -> {new_status['name']}")
+        db.commit()
+        post_to_messageboard(f"Ticket #{ticket_id} ({ticket['title']}): {old_status['name']} -> {new_status['name']}")
+        db.close()
+        return redirect(f"/ticket/{ticket_id}")
+
+    @app.route("/ticket/<int:ticket_id>/assign", methods=["POST"])
+    def update_ticket_assign(ticket_id):
+        db = get_db()
+        user_id = request.form.get("user_id")
+        user_id = int(user_id) if user_id else None
+        db.execute("UPDATE tickets SET assigned_to=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (user_id, ticket_id))
+        if user_id:
+            user = db.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
+            log_activity(db, ticket_id, user_id, "assigned", f"-> @{user['name']}")
+        db.commit()
+        db.close()
+        return redirect(f"/ticket/{ticket_id}")
+
+    @app.route("/ticket/<int:ticket_id>/comment", methods=["POST"])
+    def add_ticket_comment(ticket_id):
+        db = get_db()
+        body = request.form.get("body", "").strip()
+        if body:
+            db.execute("INSERT INTO comments (ticket_id, body) VALUES (?, ?)", (ticket_id, body))
+            log_activity(db, ticket_id, None, "comment", body[:100])
+            db.commit()
+        db.close()
+        return redirect(f"/ticket/{ticket_id}")
+
+    print(f"Questboard serving at http://localhost:{port}")
+    app.run(host="127.0.0.1", port=port, debug=False)
+
+
+# ---------------------------------------------------------------------------
+# Import from Vikunja
+# ---------------------------------------------------------------------------
+
+def cmd_import_vikunja(args):
+    """Import projects, tasks, and labels from Vikunja API."""
+    import urllib.request
+    import urllib.error
+
+    abadar_dir = os.path.expanduser("~/library/0-system/credentials")
+    abadar_py = os.path.join(abadar_dir, "abadar.py")
+    abadar_key = os.environ.get("ABADAR_KEY", "rabada")
+
+    import subprocess
+    def abadar_read(name):
+        env = os.environ.copy()
+        env["ABADAR_KEY"] = abadar_key
+        result = subprocess.run(
+            [sys.executable, abadar_py, "read", name],
+            capture_output=True, text=True, env=env, cwd=abadar_dir,
+        )
+        return result.stdout.strip()
+
+    base_url = abadar_read("vikunja_url").rstrip("/")
+    token = abadar_read("vikunja_api_token")
+
+    def vk_get(path):
+        url = f"{base_url}/api/v1{path}"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+
+    db = get_db()
+    init_db()
+
+    # Ensure we have an artificer user
+    if not db.execute("SELECT * FROM users WHERE name='artificer'").fetchone():
+        db.execute("INSERT INTO users (name, role) VALUES ('artificer', 'human')")
+
+    # Get the default (queued) status
+    queued = db.execute("SELECT * FROM statuses ORDER BY display_order LIMIT 1").fetchone()
+
+    # Import labels
+    print("Importing labels...")
+    vk_labels = vk_get("/labels")
+    label_map = {}
+    for vl in vk_labels:
+        existing = db.execute("SELECT * FROM labels WHERE name=?", (vl["title"],)).fetchone()
+        if existing:
+            label_map[vl["id"]] = existing["id"]
+        else:
+            cur = db.execute("INSERT INTO labels (name, color) VALUES (?, ?)",
+                           (vl["title"], vl.get("hex_color", "")))
+            label_map[vl["id"]] = cur.lastrowid
+        print(f"  Label: {vl['title']}")
+
+    # Import projects
+    print("Importing projects...")
+    vk_projects = vk_get("/projects")
+    proj_map = {}
+    for vp in vk_projects:
+        if vp["title"] == "Inbox":
+            continue
+        existing = db.execute("SELECT * FROM projects WHERE name=?", (vp["title"],)).fetchone()
+        if existing:
+            proj_map[vp["id"]] = existing["id"]
+        else:
+            cur = db.execute("INSERT INTO projects (name, description) VALUES (?, ?)",
+                           (vp["title"], vp.get("description", "")))
+            proj_map[vp["id"]] = cur.lastrowid
+        print(f"  Project: {vp['title']}")
+
+    # Import tasks per project
+    print("Importing tickets...")
+    artificer = db.execute("SELECT id FROM users WHERE name='artificer'").fetchone()
+    for vp_id, qb_proj_id in proj_map.items():
+        tasks = vk_get(f"/projects/{vp_id}/tasks?per_page=100")
+        for vt in tasks:
+            existing = db.execute("SELECT * FROM tickets WHERE title=? AND project_id=?",
+                                (vt["title"], qb_proj_id)).fetchone()
+            if existing:
+                print(f"  Skip (exists): #{existing['id']} {vt['title']}")
+                continue
+
+            cur = db.execute(
+                "INSERT INTO tickets (project_id, status_id, title, description, priority, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                (qb_proj_id, queued["id"], vt["title"], vt.get("description", ""), vt.get("priority", 0),
+                 artificer["id"]),
+            )
+            tid = cur.lastrowid
+            log_activity(db, tid, artificer["id"], "created", f"imported from Vikunja")
+
+            # Attach labels
+            for vl in (vt.get("labels") or []):
+                if vl["id"] in label_map:
+                    try:
+                        db.execute("INSERT INTO ticket_labels (ticket_id, label_id) VALUES (?, ?)",
+                                 (tid, label_map[vl["id"]]))
+                    except sqlite3.IntegrityError:
+                        pass
+
+            print(f"  #{tid} {vt['title']}")
+
+    db.commit()
+    db.close()
+    print("Import complete.")
+
+
+# ---------------------------------------------------------------------------
+# Argument Parser
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="qb", description="Questboard — agent-native project management")
+    sub = parser.add_subparsers(dest="command")
+
+    # user
+    u_add = sub.add_parser("user-add")
+    u_add.add_argument("name")
+    u_add.add_argument("--role", default="agent", choices=["human", "agent"])
+
+    sub.add_parser("user-list")
+
+    # project
+    p_add = sub.add_parser("project-add")
+    p_add.add_argument("name")
+    p_add.add_argument("--description", "-d")
+
+    p_list = sub.add_parser("project-list")
+    p_list.add_argument("--archived", action="store_true")
+
+    p_arc = sub.add_parser("project-archive")
+    p_arc.add_argument("project")
+
+    # tickets
+    add = sub.add_parser("add")
+    add.add_argument("title")
+    add.add_argument("--project", "-p", required=True)
+    add.add_argument("--assign", "-a")
+    add.add_argument("--priority", type=int, default=0)
+    add.add_argument("--label", "-l", action="append")
+    add.add_argument("--description", "-d")
+    add.add_argument("--creator", "-c")
+
+    ls = sub.add_parser("list")
+    ls.add_argument("--project", "-p")
+    ls.add_argument("--status", "-s")
+    ls.add_argument("--assign", "-a")
+    ls.add_argument("--label", "-l")
+    ls.add_argument("--all", action="store_true", help="Include closed tickets")
+
+    show = sub.add_parser("show")
+    show.add_argument("ticket_id", type=int)
+
+    st = sub.add_parser("status")
+    st.add_argument("ticket_id", type=int)
+    st.add_argument("status_name")
+
+    assign = sub.add_parser("assign")
+    assign.add_argument("ticket_id", type=int)
+    assign.add_argument("user")
+
+    mv = sub.add_parser("move")
+    mv.add_argument("ticket_id", type=int)
+    mv.add_argument("--project", "-p", required=True)
+
+    dn = sub.add_parser("done")
+    dn.add_argument("ticket_ids", type=int, nargs="+")
+
+    blk = sub.add_parser("block")
+    blk.add_argument("ticket_id", type=int)
+    blk.add_argument("reason", nargs="?")
+
+    cmt = sub.add_parser("comment")
+    cmt.add_argument("ticket_id", type=int)
+    cmt.add_argument("text")
+    cmt.add_argument("--user", "-u")
+
+    lbl = sub.add_parser("label")
+    lbl.add_argument("ticket_id", type=int)
+    lbl.add_argument("label_name")
+
+    ulbl = sub.add_parser("unlabel")
+    ulbl.add_argument("ticket_id", type=int)
+    ulbl.add_argument("label_name")
+
+    # label management
+    la = sub.add_parser("label-add")
+    la.add_argument("name")
+    la.add_argument("--color")
+
+    sub.add_parser("label-list")
+
+    # status management
+    sub.add_parser("status-list")
+
+    sa = sub.add_parser("status-add")
+    sa.add_argument("name")
+    sa.add_argument("--order", type=int, required=True)
+    sa.add_argument("--closed", action="store_true")
+
+    sr = sub.add_parser("status-rename")
+    sr.add_argument("old_name")
+    sr.add_argument("new_name")
+
+    so = sub.add_parser("status-reorder")
+    so.add_argument("name")
+    so.add_argument("order", type=int)
+
+    # serve
+    sv = sub.add_parser("serve")
+    sv.add_argument("--port", type=int, default=5151)
+
+    # import
+    sub.add_parser("import-vikunja")
+
+    return parser
+
+
+def main():
+    init_db()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    commands = {
+        "user-add": cmd_user_add,
+        "user-list": cmd_user_list,
+        "project-add": cmd_project_add,
+        "project-list": cmd_project_list,
+        "project-archive": cmd_project_archive,
+        "add": cmd_add,
+        "list": cmd_list,
+        "show": cmd_show,
+        "status": cmd_status,
+        "assign": cmd_assign,
+        "move": cmd_move,
+        "done": cmd_done,
+        "block": cmd_block,
+        "comment": cmd_comment,
+        "label": cmd_label,
+        "unlabel": cmd_unlabel,
+        "label-add": cmd_label_add,
+        "label-list": cmd_label_list,
+        "status-list": cmd_status_list,
+        "status-add": cmd_status_add,
+        "status-rename": cmd_status_rename,
+        "status-reorder": cmd_status_reorder,
+        "serve": cmd_serve,
+        "import-vikunja": cmd_import_vikunja,
+    }
+
+    if args.command in commands:
+        commands[args.command](args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
