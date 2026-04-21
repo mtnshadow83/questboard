@@ -761,10 +761,14 @@ a:hover { text-decoration: underline; }
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 12px;
-    cursor: pointer;
-    transition: background 0.15s;
+    cursor: grab;
+    transition: background 0.15s, opacity 0.15s, transform 0.15s;
 }
+.card:active { cursor: grabbing; }
+.card.dragging { opacity: 0.4; transform: scale(0.95); }
 .card:hover { background: var(--card-hover); border-color: var(--accent2); }
+.kanban-col.drag-over { background: var(--bg3); border-color: var(--accent); }
+.kanban-cards.drag-over { min-height: 60px; }
 .card-id { color: var(--fg2); font-size: 11px; }
 .card-title { font-size: 14px; margin: 4px 0 8px 0; line-height: 1.3; }
 .card-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -911,15 +915,18 @@ a:hover { text-decoration: underline; }
 </form>
 <div class="kanban">
     {% for status in statuses %}
-    <div class="kanban-col">
+    <div class="kanban-col" data-status-id="{{ status.id }}"
+         ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
         <div class="kanban-col-header">
             {{ status.name }}
             <span class="count">{{ columns[status.id]|length }}</span>
         </div>
-        <div class="kanban-cards">
+        <div class="kanban-cards"
+             ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
             {% for t in columns[status.id] %}
-            <a href="/ticket/{{ t.id }}" style="text-decoration:none;color:inherit;">
-            <div class="card">
+            <div class="card" draggable="true" data-ticket-id="{{ t.id }}"
+                 ondragstart="onDragStart(event)" ondragend="onDragEnd(event)"
+                 onclick="window.location='/ticket/{{ t.id }}'">
                 <div class="card-id">#{{ t.id }}{% if t.project_name %} <span class="card-project">{{ t.project_name }}</span>{% endif %}</div>
                 <div class="card-title">{{ t.title }}</div>
                 <div class="card-meta">
@@ -928,12 +935,53 @@ a:hover { text-decoration: underline; }
                     {% for l in t.labels %}<span class="card-label" {% if l.color %}style="background:{{ l.color }}"{% endif %}>{{ l.name }}</span>{% endfor %}
                 </div>
             </div>
-            </a>
             {% endfor %}
         </div>
     </div>
     {% endfor %}
 </div>
+<script>
+let draggedId = null;
+
+function onDragStart(e) {
+    draggedId = e.target.closest('.card').dataset.ticketId;
+    e.target.closest('.card').classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', draggedId);
+}
+
+function onDragEnd(e) {
+    e.target.closest('.card').classList.remove('dragging');
+    document.querySelectorAll('.kanban-col').forEach(c => c.classList.remove('drag-over'));
+}
+
+function onDragOver(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const col = e.target.closest('.kanban-col');
+    if (col) col.classList.add('drag-over');
+}
+
+function onDragLeave(e) {
+    const col = e.target.closest('.kanban-col');
+    if (col && !col.contains(e.relatedTarget)) col.classList.remove('drag-over');
+}
+
+function onDrop(e) {
+    e.preventDefault();
+    const col = e.target.closest('.kanban-col');
+    if (!col || !draggedId) return;
+    col.classList.remove('drag-over');
+    const statusId = col.dataset.statusId;
+    fetch('/api/ticket/' + draggedId + '/status', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({status_id: parseInt(statusId)})
+    }).then(r => {
+        if (r.ok) window.location.reload();
+    });
+}
+</script>
 {% endblock %}"""
 
     LIST_PAGE = """{% extends layout %}
@@ -1231,6 +1279,28 @@ a:hover { text-decoration: underline; }
         post_to_messageboard(f"Ticket #{ticket_id} ({ticket['title']}): {old_status['name']} -> {new_status['name']}")
         db.close()
         return redirect(f"/ticket/{ticket_id}")
+
+    @app.route("/api/ticket/<int:ticket_id>/status", methods=["POST"])
+    def api_update_ticket_status(ticket_id):
+        db = get_db()
+        data = request.get_json()
+        new_status_id = int(data["status_id"])
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not ticket:
+            db.close()
+            return json.dumps({"error": "not found"}), 404
+        old_status = db.execute("SELECT name FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
+        new_status = db.execute("SELECT name FROM statuses WHERE id=?", (new_status_id,)).fetchone()
+        if old_status["name"] == new_status["name"]:
+            db.close()
+            return json.dumps({"ok": True, "changed": False})
+        db.execute("UPDATE tickets SET status_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (new_status_id, ticket_id))
+        log_activity(db, ticket_id, None, "status", f"{old_status['name']} -> {new_status['name']}")
+        db.commit()
+        post_to_messageboard(f"Ticket #{ticket_id} ({ticket['title']}): {old_status['name']} -> {new_status['name']}")
+        db.close()
+        return json.dumps({"ok": True, "changed": True})
 
     @app.route("/ticket/<int:ticket_id>/assign", methods=["POST"])
     def update_ticket_assign(ticket_id):
