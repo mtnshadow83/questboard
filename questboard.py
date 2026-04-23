@@ -17,15 +17,29 @@ import datetime
 import json
 import textwrap
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "questboard.db")
+# Fix Windows console encoding for Unicode content
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+DB_DIR = os.path.join(os.path.expanduser("~"), "library", "0-system", "claude", "toolsets", "questboard", "db")
+DB_DEFAULT = "questboard.db"
+DB_PATH = os.path.join(DB_DIR, DB_DEFAULT)
 MESSAGEBOARD_DIR = os.path.expanduser("~/library/0-system/claude/messageboard")
 
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
-def get_db():
-    db = sqlite3.connect(DB_PATH)
+def list_dbs():
+    """Return list of .db filenames available in DB_DIR."""
+    if not os.path.isdir(DB_DIR):
+        return []
+    return sorted(f for f in os.listdir(DB_DIR) if f.endswith(".db"))
+
+
+def get_db(db_path=None):
+    path = db_path or DB_PATH
+    db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
@@ -303,6 +317,44 @@ def cmd_add(args):
     db.close()
 
 
+def cmd_edit(args):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
+    if not ticket:
+        print(f"Ticket not found: {args.ticket_id}")
+        db.close()
+        return
+
+    changes = []
+    if args.title:
+        old_title = ticket["title"]
+        db.execute("UPDATE tickets SET title=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (args.title, args.ticket_id))
+        log_activity(db, args.ticket_id, None, "edited", f"title: {old_title} -> {args.title}")
+        changes.append(f"title -> {args.title}")
+
+    if args.description is not None:
+        db.execute("UPDATE tickets SET description=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (args.description, args.ticket_id))
+        log_activity(db, args.ticket_id, None, "edited", f"description updated")
+        changes.append("description updated")
+
+    if args.priority is not None:
+        db.execute("UPDATE tickets SET priority=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (args.priority, args.ticket_id))
+        log_activity(db, args.ticket_id, None, "edited", f"priority -> {args.priority}")
+        changes.append(f"priority -> {args.priority}")
+
+    if not changes:
+        print(f"#{args.ticket_id} — nothing to change (provide --title, --description, or --priority)")
+        db.close()
+        return
+
+    db.commit()
+    print(f"#{args.ticket_id} updated: {', '.join(changes)}")
+    db.close()
+
+
 def cmd_list(args):
     db = get_db()
     query = """
@@ -338,7 +390,7 @@ def cmd_list(args):
         query += " AND t.id IN (SELECT tl.ticket_id FROM ticket_labels tl JOIN labels l ON l.id = tl.label_id WHERE l.name = ?)"
         params.append(args.label)
 
-    if not args.all:
+    if not args.all and not args.status:
         query += " AND s.is_closed = 0"
 
     query += " ORDER BY t.priority DESC, t.id"
@@ -428,48 +480,45 @@ def cmd_status(args):
 
 def cmd_assign(args):
     db = get_db()
-    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
-    if not ticket:
-        print(f"Ticket not found: {args.ticket_id}")
-        db.close()
-        return
-
     user = resolve_user(db, args.user)
     if not user:
         print(f"User not found: {args.user}")
         db.close()
         return
 
-    db.execute("UPDATE tickets SET assigned_to=?, updated_at=datetime('now','localtime') WHERE id=?",
-               (user["id"], args.ticket_id))
-    log_activity(db, args.ticket_id, user["id"], "assigned", f"-> @{user['name']}")
-    db.commit()
+    for tid in args.ticket_ids:
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+        if not ticket:
+            print(f"Ticket not found: {tid}")
+            continue
+        db.execute("UPDATE tickets SET assigned_to=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (user["id"], tid))
+        log_activity(db, tid, user["id"], "assigned", f"-> @{user['name']}")
+        print(f"#{tid} -> @{user['name']}")
 
-    print(f"#{args.ticket_id} -> @{user['name']}")
-    post_to_messageboard(f"Ticket #{args.ticket_id} ({ticket['title']}): assigned to @{user['name']}")
+    db.commit()
     db.close()
 
 
 def cmd_move(args):
     db = get_db()
-    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
-    if not ticket:
-        print(f"Ticket not found: {args.ticket_id}")
-        db.close()
-        return
-
     proj = resolve_project(db, args.project)
     if not proj:
         print(f"Project not found: {args.project}")
         db.close()
         return
 
-    db.execute("UPDATE tickets SET project_id=?, updated_at=datetime('now','localtime') WHERE id=?",
-               (proj["id"], args.ticket_id))
-    log_activity(db, args.ticket_id, None, "moved", f"-> {proj['name']} (#{proj['id']})")
-    db.commit()
+    for tid in args.ticket_ids:
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+        if not ticket:
+            print(f"Ticket not found: {tid}")
+            continue
+        db.execute("UPDATE tickets SET project_id=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (proj["id"], tid))
+        log_activity(db, tid, None, "moved", f"-> {proj['name']} (#{proj['id']})")
+        print(f"#{tid} moved to {proj['name']} (#{proj['id']})")
 
-    print(f"#{args.ticket_id} moved to {proj['name']} (#{proj['id']})")
+    db.commit()
     db.close()
 
 
@@ -548,12 +597,6 @@ def cmd_comment(args):
 
 def cmd_label(args):
     db = get_db()
-    ticket = db.execute("SELECT * FROM tickets WHERE id=?", (args.ticket_id,)).fetchone()
-    if not ticket:
-        print(f"Ticket not found: {args.ticket_id}")
-        db.close()
-        return
-
     label = db.execute("SELECT * FROM labels WHERE name=?", (args.label_name,)).fetchone()
     if not label:
         cur = db.execute("INSERT INTO labels (name) VALUES (?)", (args.label_name,))
@@ -561,13 +604,19 @@ def cmd_label(args):
     else:
         label_id = label["id"]
 
-    try:
-        db.execute("INSERT INTO ticket_labels (ticket_id, label_id) VALUES (?, ?)", (args.ticket_id, label_id))
-        log_activity(db, args.ticket_id, None, "label", f"+{args.label_name}")
-        db.commit()
-        print(f"Label {args.label_name} added to #{args.ticket_id}")
-    except sqlite3.IntegrityError:
-        print(f"#{args.ticket_id} already has label {args.label_name}")
+    for tid in args.ticket_ids:
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+        if not ticket:
+            print(f"Ticket not found: {tid}")
+            continue
+        try:
+            db.execute("INSERT INTO ticket_labels (ticket_id, label_id) VALUES (?, ?)", (tid, label_id))
+            log_activity(db, tid, None, "label", f"+{args.label_name}")
+            print(f"Label {args.label_name} added to #{tid}")
+        except sqlite3.IntegrityError:
+            print(f"#{tid} already has label {args.label_name}")
+
+    db.commit()
     db.close()
 
 
@@ -578,10 +627,15 @@ def cmd_unlabel(args):
         print(f"Label not found: {args.label_name}")
         db.close()
         return
-    db.execute("DELETE FROM ticket_labels WHERE ticket_id=? AND label_id=?", (args.ticket_id, label["id"]))
-    log_activity(db, args.ticket_id, None, "label", f"-{args.label_name}")
+    for tid in args.ticket_ids:
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+        if not ticket:
+            print(f"Ticket not found: {tid}")
+            continue
+        db.execute("DELETE FROM ticket_labels WHERE ticket_id=? AND label_id=?", (tid, label["id"]))
+        log_activity(db, tid, None, "label", f"-{args.label_name}")
+        print(f"Label {args.label_name} removed from #{tid}")
     db.commit()
-    print(f"Label {args.label_name} removed from #{args.ticket_id}")
     db.close()
 
 
@@ -659,6 +713,9 @@ def cmd_serve(args):
     app = Flask(__name__)
     port = args.port or 5151
 
+    # Track active DB path for the web session
+    app.config["ACTIVE_DB"] = DB_PATH
+
     LAYOUT = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -666,21 +723,69 @@ def cmd_serve(args):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Questboard{% if subtitle %} — {{ subtitle }}{% endif %}</title>
 <style>
-:root {
+:root, [data-theme="tavern"] {
+    --bg: #1a1510;
+    --bg2: #231e18;
+    --bg3: #342a20;
+    --fg: #e8e0d4;
+    --fg2: #b0a898;
+    --accent: #CDA473;
+    --accent2: #665841;
+    --green: #7F9D9D;
+    --yellow: #CDA473;
+    --red: #a05a3a;
+    --blue: #B0AD92;
+    --border: #3a3228;
+    --card: #231e18;
+    --card-hover: #2d261e;
+}
+[data-theme="goblin-forest"] {
+    --bg: #141208;
+    --bg2: #1e1a10;
+    --bg3: #3A3424;
+    --fg: #e4ddd0;
+    --fg2: #B0A784;
+    --accent: #B0A784;
+    --accent2: #5B4730;
+    --green: #6a7a4a;
+    --yellow: #B0A784;
+    --red: #8a4a2a;
+    --blue: #908868;
+    --border: #332e20;
+    --card: #1e1a10;
+    --card-hover: #282214;
+}
+[data-theme="arcane"] {
     --bg: #1a1a2e;
-    --bg2: #16213e;
-    --bg3: #0f3460;
-    --fg: #e0e0e0;
-    --fg2: #a0a0b0;
-    --accent: #e94560;
-    --accent2: #533483;
-    --green: #4a7c59;
-    --yellow: #d4a017;
-    --red: #cc3333;
-    --blue: #3a86ff;
-    --border: #2a2a4a;
-    --card: #16213e;
-    --card-hover: #1a2744;
+    --bg2: #22223a;
+    --bg3: #3F3F6A;
+    --fg: #e4e0ea;
+    --fg2: #D6D0DD;
+    --accent: #94A9C8;
+    --accent2: #3F3F6A;
+    --green: #7a8aaa;
+    --yellow: #D6D0DD;
+    --red: #8a5a7a;
+    --blue: #8295BE;
+    --border: #3a3a5a;
+    --card: #22223a;
+    --card-hover: #2a2a44;
+}
+[data-theme="cartographer"] {
+    --bg: #1a1c20;
+    --bg2: #24262a;
+    --bg3: #42454D;
+    --fg: #e4dcd6;
+    --fg2: #9A9D97;
+    --accent: #DC9584;
+    --accent2: #42454D;
+    --green: #68879C;
+    --yellow: #DC9584;
+    --red: #b06a5a;
+    --blue: #68879C;
+    --border: #383a40;
+    --card: #24262a;
+    --card-hover: #2e3034;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
@@ -696,6 +801,8 @@ a:hover { text-decoration: underline; }
     gap: 24px;
 }
 .topbar h1 { font-size: 18px; color: var(--accent); font-weight: 700; letter-spacing: 1px; }
+.topbar h1 a { color: var(--accent); text-decoration: none; }
+.topbar h1 a:hover { text-decoration: none; opacity: 0.8; }
 .topbar nav { display: flex; gap: 16px; }
 .topbar nav a { color: var(--fg2); font-size: 14px; padding: 4px 8px; border-radius: 4px; }
 .topbar nav a:hover, .topbar nav a.active { color: var(--fg); background: var(--bg3); text-decoration: none; }
@@ -846,6 +953,18 @@ a:hover { text-decoration: underline; }
 .status-na { background: var(--fg2); color: var(--bg); }
 
 /* Edit forms */
+.theme-select {
+    margin-left: auto;
+    background: var(--bg);
+    color: var(--fg2);
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.theme-select:hover { color: var(--fg); border-color: var(--accent); }
+
 .edit-form {
     max-width: 600px;
     margin: 24px auto;
@@ -878,13 +997,39 @@ a:hover { text-decoration: underline; }
 </head>
 <body>
 <div class="topbar">
-    <h1>QUESTBOARD</h1>
+    <h1><a href="/">QUESTBOARD</a></h1>
     <nav>
         <a href="/" class="{{ 'active' if view == 'kanban' else '' }}">Kanban</a>
         <a href="/list" class="{{ 'active' if view == 'list' else '' }}">List</a>
     </nav>
+    <form method="post" action="/switch-db" style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+        <label style="color:var(--fg2);font-size:13px;">DB:</label>
+        <select name="db" onchange="this.form.submit()" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:4px 8px;border-radius:4px;font-size:13px;">
+            {% for dbname in available_dbs %}
+            <option value="{{ dbname }}" {{ 'selected' if dbname == active_db }}>{{ dbname }}</option>
+            {% endfor %}
+        </select>
+    </form>
+    <select class="theme-select" id="theme-toggle" onchange="setTheme(this.value)">
+        <option value="tavern">Tavern</option>
+        <option value="goblin-forest">Goblin Forest</option>
+        <option value="arcane">Arcane</option>
+        <option value="cartographer">Cartographer</option>
+    </select>
 </div>
 {% block content %}{% endblock %}
+<script>
+function setTheme(name) {
+    document.documentElement.setAttribute('data-theme', name);
+    localStorage.setItem('qb-theme', name);
+}
+(function() {
+    var saved = localStorage.getItem('qb-theme') || 'tavern';
+    document.documentElement.setAttribute('data-theme', saved);
+    var sel = document.getElementById('theme-toggle');
+    if (sel) sel.value = saved;
+})();
+</script>
 </body>
 </html>"""
 
@@ -1050,14 +1195,12 @@ function onDrop(e) {
             </form>
         </dd>
         <dt>Assigned to</dt><dd>
-            <form method="post" action="/ticket/{{ ticket.id }}/assign" style="display:inline;">
-                <select name="user_id" onchange="this.form.submit()">
+                <select id="assign-select" onchange="updateAssign(this.value)">
                     <option value="">Unassigned</option>
                     {% for u in users %}
                     <option value="{{ u.id }}" {{ 'selected' if ticket.assigned_to == u.id }}>{{ u.name }}</option>
                     {% endfor %}
                 </select>
-            </form>
         </dd>
         <dt>Priority</dt><dd>{{ ticket.priority }} {{ '!' * ticket.priority if ticket.priority > 0 else '' }}</dd>
         <dt>Labels</dt><dd>{% for l in labels %}{{ l }} {% endfor %}</dd>
@@ -1080,8 +1223,24 @@ function onDrop(e) {
 
     <form method="post" action="/ticket/{{ ticket.id }}/comment" style="margin-top:16px;">
         <textarea name="body" placeholder="Add a comment..." style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:8px;min-height:60px;resize:vertical;"></textarea>
-        <button type="submit" style="margin-top:8px;background:var(--accent);color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Comment</button>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <select name="user_id" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;">
+                {% for u in users %}
+                <option value="{{ u.id }}">{{ u.name }}</option>
+                {% endfor %}
+            </select>
+            <button type="submit" style="background:var(--accent);color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Comment</button>
+        </div>
     </form>
+    <script>
+    function updateAssign(userId) {
+        fetch('/ticket/{{ ticket.id }}/assign', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({user_id: userId || null})
+        });
+    }
+    </script>
 
     <div class="activity-log">
         <h3 style="color:var(--fg2);font-size:14px;margin:20px 0 12px 0;">Activity Log</h3>
@@ -1120,7 +1279,7 @@ function onDrop(e) {
     })
 
     def get_filter_context(req):
-        db = get_db()
+        db = get_db(app.config["ACTIVE_DB"])
         projects = db.execute("SELECT * FROM projects WHERE archived=0 ORDER BY name").fetchall()
         users = db.execute("SELECT * FROM users ORDER BY name").fetchall()
         labels = db.execute("SELECT * FROM labels ORDER BY name").fetchall()
@@ -1130,6 +1289,20 @@ function onDrop(e) {
         current_label = req.args.get("label", "")
 
         return db, projects, users, labels, current_project, current_assignee, current_label
+
+    @app.context_processor
+    def inject_db_info():
+        return {
+            "available_dbs": list_dbs(),
+            "active_db": os.path.basename(app.config["ACTIVE_DB"]),
+        }
+
+    @app.route("/switch-db", methods=["POST"])
+    def switch_db():
+        chosen = request.form.get("db", DB_DEFAULT)
+        if chosen in list_dbs():
+            app.config["ACTIVE_DB"] = os.path.join(DB_DIR, chosen)
+        return redirect(request.referrer or "/")
 
     def build_ticket_query(current_project, current_assignee, current_label, show_closed=False):
         query = """
@@ -1226,7 +1399,7 @@ function onDrop(e) {
 
     @app.route("/ticket/<int:ticket_id>")
     def ticket_detail(ticket_id):
-        db = get_db()
+        db = get_db(app.config["ACTIVE_DB"])
         ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         if not ticket:
             return "Ticket not found", 404
@@ -1267,7 +1440,7 @@ function onDrop(e) {
 
     @app.route("/ticket/<int:ticket_id>/status", methods=["POST"])
     def update_ticket_status(ticket_id):
-        db = get_db()
+        db = get_db(app.config["ACTIVE_DB"])
         new_status_id = int(request.form["status_id"])
         ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         old_status = db.execute("SELECT name FROM statuses WHERE id=?", (ticket["status_id"],)).fetchone()
@@ -1282,7 +1455,7 @@ function onDrop(e) {
 
     @app.route("/api/ticket/<int:ticket_id>/status", methods=["POST"])
     def api_update_ticket_status(ticket_id):
-        db = get_db()
+        db = get_db(app.config["ACTIVE_DB"])
         data = request.get_json()
         new_status_id = int(data["status_id"])
         ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
@@ -1304,25 +1477,39 @@ function onDrop(e) {
 
     @app.route("/ticket/<int:ticket_id>/assign", methods=["POST"])
     def update_ticket_assign(ticket_id):
-        db = get_db()
-        user_id = request.form.get("user_id")
+        db = get_db(app.config["ACTIVE_DB"])
+        # Support both form and JSON
+        if request.is_json:
+            data = request.get_json()
+            user_id = data.get("user_id")
+        else:
+            user_id = request.form.get("user_id")
         user_id = int(user_id) if user_id else None
         db.execute("UPDATE tickets SET assigned_to=?, updated_at=datetime('now','localtime') WHERE id=?",
                    (user_id, ticket_id))
+        assignee_name = None
         if user_id:
             user = db.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
+            assignee_name = user["name"]
             log_activity(db, ticket_id, user_id, "assigned", f"-> @{user['name']}")
+        else:
+            log_activity(db, ticket_id, None, "unassigned", "")
         db.commit()
         db.close()
+        if request.is_json:
+            return json.dumps({"ok": True, "assignee": assignee_name})
         return redirect(f"/ticket/{ticket_id}")
 
     @app.route("/ticket/<int:ticket_id>/comment", methods=["POST"])
     def add_ticket_comment(ticket_id):
-        db = get_db()
+        db = get_db(app.config["ACTIVE_DB"])
         body = request.form.get("body", "").strip()
+        user_id = request.form.get("user_id")
+        user_id = int(user_id) if user_id else None
         if body:
-            db.execute("INSERT INTO comments (ticket_id, body) VALUES (?, ?)", (ticket_id, body))
-            log_activity(db, ticket_id, None, "comment", body[:100])
+            db.execute("INSERT INTO comments (ticket_id, user_id, body) VALUES (?, ?, ?)",
+                       (ticket_id, user_id, body))
+            log_activity(db, ticket_id, user_id, "comment", body[:100])
             db.commit()
         db.close()
         return redirect(f"/ticket/{ticket_id}")
@@ -1446,6 +1633,7 @@ def cmd_import_vikunja(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="qb", description="Questboard — agent-native project management")
+    parser.add_argument("--db", help="Database filename in db/ directory (e.g. questboard.db)")
     sub = parser.add_subparsers(dest="command")
 
     # user
@@ -1486,16 +1674,22 @@ def build_parser():
     show = sub.add_parser("show")
     show.add_argument("ticket_id", type=int)
 
+    edit = sub.add_parser("edit")
+    edit.add_argument("ticket_id", type=int)
+    edit.add_argument("--title", "-t")
+    edit.add_argument("--description", "-d")
+    edit.add_argument("--priority", type=int)
+
     st = sub.add_parser("status")
     st.add_argument("ticket_id", type=int)
     st.add_argument("status_name")
 
     assign = sub.add_parser("assign")
-    assign.add_argument("ticket_id", type=int)
-    assign.add_argument("user")
+    assign.add_argument("ticket_ids", type=int, nargs="+")
+    assign.add_argument("--user", "-u", required=True)
 
     mv = sub.add_parser("move")
-    mv.add_argument("ticket_id", type=int)
+    mv.add_argument("ticket_ids", type=int, nargs="+")
     mv.add_argument("--project", "-p", required=True)
 
     dn = sub.add_parser("done")
@@ -1511,12 +1705,12 @@ def build_parser():
     cmt.add_argument("--user", "-u")
 
     lbl = sub.add_parser("label")
-    lbl.add_argument("ticket_id", type=int)
-    lbl.add_argument("label_name")
+    lbl.add_argument("ticket_ids", type=int, nargs="+")
+    lbl.add_argument("--label", "-l", dest="label_name", required=True)
 
     ulbl = sub.add_parser("unlabel")
-    ulbl.add_argument("ticket_id", type=int)
-    ulbl.add_argument("label_name")
+    ulbl.add_argument("ticket_ids", type=int, nargs="+")
+    ulbl.add_argument("--label", "-l", dest="label_name", required=True)
 
     # label management
     la = sub.add_parser("label-add")
@@ -1552,9 +1746,14 @@ def build_parser():
 
 
 def main():
-    init_db()
+    global DB_PATH
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.db:
+        DB_PATH = os.path.join(DB_DIR, args.db)
+
+    init_db()
 
     commands = {
         "user-add": cmd_user_add,
@@ -1563,6 +1762,7 @@ def main():
         "project-list": cmd_project_list,
         "project-archive": cmd_project_archive,
         "add": cmd_add,
+        "edit": cmd_edit,
         "list": cmd_list,
         "show": cmd_show,
         "status": cmd_status,
