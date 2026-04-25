@@ -1875,6 +1875,9 @@ function onDrop(e) {
         if not data or not data.get("title"):
             db.close()
             return json.dumps({"error": "title required"}), 400
+        if not data.get("creator"):
+            db.close()
+            return json.dumps({"error": "creator required — every ticket needs a name"}), 400
         proj = resolve_project(db, data.get("project", "pings"))
         if not proj:
             db.close()
@@ -2098,6 +2101,47 @@ function onDrop(e) {
         db.close()
         return json.dumps(result), 200, {"Content-Type": "application/json"}
 
+    @app.route("/api/help")
+    def api_help():
+        help_text = {
+            "name": "Questboard",
+            "description": "Agent-native project management. CLI + web UI + JSON API.",
+            "remote_cli": "Set QB_REMOTE=https://questboard-ec2.tail7f6073.ts.net then use 'python questboard.py <command>' normally.",
+            "policy": "Agents cannot write to the 'artificer' project. Route tickets to 'pings'. Human promotes via 'qb promote <id>'.",
+            "notifications": "Only 'blocked' status on /pings triggers phone/desktop notifications. Use 'qb block <id> \"reason\"' when you need human attention.",
+            "commands": {
+                "add": "qb add \"title\" -p <project> [-a user] [-l label] [--priority N] [-c creator]",
+                "list": "qb list [-p project] [-s status] [-a user] [--all]",
+                "show": "qb show <id>",
+                "status": "qb status <id> <status-name>",
+                "block": "qb block <id> [\"reason\"] — sets blocked + optional comment, triggers notification",
+                "done": "qb done <id> [<id>...]",
+                "assign": "qb assign <id> [<id>...] -u <user>",
+                "comment": "qb comment <id> \"text\" [-u user]",
+                "move": "qb move <id> [<id>...] -p <project>",
+                "label": "qb label <id> [<id>...] -l <label>",
+                "promote": "qb promote <id> [<id>...] [-p project] — move from /pings to target (default: artificer)",
+                "project-list": "qb project-list",
+            },
+            "api_base": "https://questboard-ec2.tail7f6073.ts.net",
+            "api_endpoints": {
+                "GET /api/tickets": "List tickets (?project=&status=&assignee=&label=&all=1)",
+                "POST /api/tickets": "Create ticket ({title, project, priority, assignee, creator, labels})",
+                "GET /api/tickets/<id>": "Show ticket + comments",
+                "PUT /api/tickets/<id>/status": "Change status ({status})",
+                "POST /api/tickets/<id>/block": "Block ({reason})",
+                "POST /api/tickets/<id>/done": "Close",
+                "PUT /api/tickets/<id>/assign": "Assign ({assignee})",
+                "POST /api/tickets/<id>/comment": "Comment ({body, user})",
+                "PUT /api/tickets/<id>/move": "Move ({project})",
+                "POST /api/tickets/<id>/promote": "Promote ({project})",
+                "GET /api/projects": "List projects",
+                "GET /api/users": "List users",
+                "GET /api/statuses": "List statuses",
+            },
+        }
+        return json.dumps(help_text, indent=2), 200, {"Content-Type": "application/json"}
+
     print(f"Questboard serving at http://localhost:{port}")
     host = os.environ.get("QB_HOST", "127.0.0.1")
     app.run(host=host, port=port, debug=False)
@@ -2247,7 +2291,7 @@ def build_parser():
     add.add_argument("--priority", type=int, default=0)
     add.add_argument("--label", "-l", action="append")
     add.add_argument("--description", "-d")
-    add.add_argument("--creator", "-c")
+    add.add_argument("--creator", "-c", required=True, help="Who is creating this ticket (required)")
 
     ls = sub.add_parser("list")
     ls.add_argument("--project", "-p")
