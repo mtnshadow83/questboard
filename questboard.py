@@ -953,6 +953,25 @@ a:hover { text-decoration: underline; }
 .status-na { background: var(--fg2); color: var(--bg); }
 
 /* Edit forms */
+.tag-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--accent2);
+    color: var(--fg);
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+}
+.tag-x {
+    cursor: pointer;
+    font-size: 14px;
+    color: var(--fg2);
+    margin-left: 2px;
+}
+.tag-x:hover { color: var(--red); }
+.pri-dot:hover { color: var(--yellow) !important; }
+
 .theme-select {
     margin-left: auto;
     background: var(--bg);
@@ -1202,8 +1221,25 @@ function onDrop(e) {
                     {% endfor %}
                 </select>
         </dd>
-        <dt>Priority</dt><dd>{{ ticket.priority }} {{ '!' * ticket.priority if ticket.priority > 0 else '' }}</dd>
-        <dt>Labels</dt><dd>{% for l in labels %}{{ l }} {% endfor %}</dd>
+        <dt>Priority</dt><dd>
+            <div id="priority-toggle" style="display:inline-flex;gap:4px;">
+                {% for i in range(1,6) %}
+                <span class="pri-dot" data-val="{{ i }}" onclick="setPriority({{ i }})"
+                      style="cursor:pointer;font-size:16px;color:{{ 'var(--yellow)' if i <= ticket.priority else 'var(--border)' }};">!</span>
+                {% endfor %}
+                <span style="color:var(--fg2);font-size:12px;margin-left:6px;" id="pri-label">{{ ticket.priority }}</span>
+            </div>
+        </dd>
+        <dt>Labels</dt><dd>
+            <div id="tag-container" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+                {% for l in labels %}
+                <span class="tag-pill" data-label="{{ l }}">{{ l }}<span class="tag-x" onclick="removeLabel('{{ l }}')">&times;</span></span>
+                {% endfor %}
+                <input type="text" id="tag-input" placeholder="add label..."
+                       style="background:transparent;border:none;color:var(--fg);font-size:13px;outline:none;width:100px;"
+                       onkeydown="if(event.key==='Enter'){event.preventDefault();addLabel(this.value);this.value='';}">
+            </div>
+        </dd>
         <dt>Created</dt><dd>{{ ticket.created_at }}{% if creator_name %} by {{ creator_name }}{% endif %}</dd>
         <dt>Updated</dt><dd>{{ ticket.updated_at }}</dd>
     </dl>
@@ -1238,6 +1274,48 @@ function onDrop(e) {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({user_id: userId || null})
+        });
+    }
+    function setPriority(val) {
+        fetch('/api/ticket/{{ ticket.id }}/priority', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({priority: val})
+        }).then(function() {
+            document.querySelectorAll('.pri-dot').forEach(function(dot) {
+                dot.style.color = parseInt(dot.dataset.val) <= val ? 'var(--yellow)' : 'var(--border)';
+            });
+            document.getElementById('pri-label').textContent = val;
+        });
+    }
+    function addLabel(name) {
+        name = name.trim();
+        if (!name) return;
+        fetch('/api/ticket/{{ ticket.id }}/label', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({label: name})
+        }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.ok) {
+                var pill = document.createElement('span');
+                pill.className = 'tag-pill';
+                pill.dataset.label = name;
+                pill.innerHTML = name + '<span class="tag-x" onclick="removeLabel(\'' + name + '\')">&times;</span>';
+                var input = document.getElementById('tag-input');
+                input.parentNode.insertBefore(pill, input);
+            }
+        });
+    }
+    function removeLabel(name) {
+        fetch('/api/ticket/{{ ticket.id }}/unlabel', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({label: name})
+        }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.ok) {
+                var pills = document.querySelectorAll('.tag-pill');
+                pills.forEach(function(p) { if (p.dataset.label === name) p.remove(); });
+            }
         });
     }
     </script>
@@ -1513,6 +1591,62 @@ function onDrop(e) {
             db.commit()
         db.close()
         return redirect(f"/ticket/{ticket_id}")
+
+    @app.route("/api/ticket/<int:ticket_id>/priority", methods=["POST"])
+    def api_update_priority(ticket_id):
+        db = get_db(app.config["ACTIVE_DB"])
+        data = request.get_json()
+        priority = int(data["priority"])
+        priority = max(0, min(5, priority))
+        ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not ticket:
+            db.close()
+            return json.dumps({"error": "not found"}), 404
+        db.execute("UPDATE tickets SET priority=?, updated_at=datetime('now','localtime') WHERE id=?",
+                   (priority, ticket_id))
+        log_activity(db, ticket_id, None, "edited", f"priority -> {priority}")
+        db.commit()
+        db.close()
+        return json.dumps({"ok": True, "priority": priority})
+
+    @app.route("/api/ticket/<int:ticket_id>/label", methods=["POST"])
+    def api_add_label(ticket_id):
+        db = get_db(app.config["ACTIVE_DB"])
+        data = request.get_json()
+        label_name = data["label"].strip()
+        if not label_name:
+            db.close()
+            return json.dumps({"error": "empty label"}), 400
+        label = db.execute("SELECT * FROM labels WHERE name=?", (label_name,)).fetchone()
+        if not label:
+            cur = db.execute("INSERT INTO labels (name) VALUES (?)", (label_name,))
+            label_id = cur.lastrowid
+        else:
+            label_id = label["id"]
+        try:
+            db.execute("INSERT INTO ticket_labels (ticket_id, label_id) VALUES (?, ?)", (ticket_id, label_id))
+            log_activity(db, ticket_id, None, "label", f"+{label_name}")
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.close()
+            return json.dumps({"ok": True, "existing": True})
+        db.close()
+        return json.dumps({"ok": True})
+
+    @app.route("/api/ticket/<int:ticket_id>/unlabel", methods=["POST"])
+    def api_remove_label(ticket_id):
+        db = get_db(app.config["ACTIVE_DB"])
+        data = request.get_json()
+        label_name = data["label"].strip()
+        label = db.execute("SELECT * FROM labels WHERE name=?", (label_name,)).fetchone()
+        if not label:
+            db.close()
+            return json.dumps({"error": "label not found"}), 404
+        db.execute("DELETE FROM ticket_labels WHERE ticket_id=? AND label_id=?", (ticket_id, label["id"]))
+        log_activity(db, ticket_id, None, "label", f"-{label_name}")
+        db.commit()
+        db.close()
+        return json.dumps({"ok": True})
 
     print(f"Questboard serving at http://localhost:{port}")
     app.run(host="127.0.0.1", port=port, debug=False)
