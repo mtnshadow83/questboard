@@ -1,4 +1,6 @@
-# Pingle — Build Plan
+# Pingle — Build Plan (Historical)
+
+> **v0.1 — historical.** This plan covers the initial PowerShell toast approach, which was superseded by the PyQt5 Win95 implementation. See `planning/ec2-finalization-plan.md` for the current deployment plan.
 
 **Version:** 0.1  
 **Operator:** Artificer  

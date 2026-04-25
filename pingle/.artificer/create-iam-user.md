@@ -1,4 +1,6 @@
-# Create IAM User for EC2 Provisioning
+# Create IAM User for EC2 Provisioning — Completed 2026-04-24
+
+> IAM user `forge` created with EC2FullAccess. Keys stored in `forge3/keystore.db`.
 
 You are on the IAM Dashboard. Follow these steps exactly.
 

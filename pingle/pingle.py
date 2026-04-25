@@ -11,7 +11,11 @@ Usage:
 
 import sys
 import os
-import sqlite3
+import json
+import urllib.request
+import winsound
+import threading
+import urllib.error
 import webbrowser
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton,
@@ -21,11 +25,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import QFont, QCursor, QLinearGradient, QColor, QPainter
 
-DB_PATH = os.path.join(
-    os.path.expanduser("~"),
-    "library", "0-system", "claude", "toolsets", "questboard", "db", "questboard.db",
-)
-QB_URL = "http://localhost:5151"
+QB_API = "https://questboard-ec2.tail7f6073.ts.net"
+QB_URL = QB_API
 POLL_MS = 3000
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pingle.log")
 LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pingle.lock")
@@ -40,6 +41,23 @@ W95_TITLE_BLUE = "#000080"
 W95_TITLE_BLUE_LIGHT = "#1084d0"
 W95_TEXT = "#000000"
 W95_FONT = "MS Sans Serif"
+
+
+def droid_chirp():
+    """Play an R2-D2 style chirp sequence in a background thread."""
+    import time
+    def _chirp():
+        beeps = [
+            (1200, 80),
+            (800, 120),
+            (1600, 60),
+            (1000, 100),
+            (1400, 150),
+        ]
+        for freq, dur in beeps:
+            winsound.Beep(freq, dur)
+            time.sleep(0.05)
+    threading.Thread(target=_chirp, daemon=True).start()
 
 
 def win95_raised():
@@ -234,12 +252,19 @@ class PingleNotification(QWidget):
 
     def show_in_slot(self, slot):
         self.slot = slot
-        screen = QApplication.primaryScreen().geometry()
+        # Find the screen the cursor is on — notifications appear where you're working
+        cursor_screen = QApplication.screenAt(QCursor.pos())
+        if cursor_screen is None:
+            cursor_screen = QApplication.primaryScreen()
+        screen = cursor_screen.availableGeometry()
         x = screen.right() - self.WIDTH - self.MARGIN
         y = screen.top() + self.MARGIN + slot * (self.HEIGHT + self.GAP)
         self.move(x, y)
         self.show()
         self.raise_()
+        self.activateWindow()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+        droid_chirp()
 
     def fade_out(self):
         self.anim = QPropertyAnimation(self.opacity_effect, b"opacity")
@@ -291,25 +316,17 @@ class PingleNotification(QWidget):
 # DB watcher
 # ---------------------------------------------------------------------------
 
-def get_db():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    return db
-
-
-def get_pings_project_id(db):
-    row = db.execute("SELECT id FROM projects WHERE name='pings'").fetchone()
-    return row["id"] if row else None
-
-
-def get_max_activity_id():
+def api_get(path):
+    """Fetch JSON from the Questboard API."""
     try:
-        db = get_db()
-        row = db.execute("SELECT MAX(id) as m FROM activity_log").fetchone()
-        db.close()
-        return row["m"] or 0
+        resp = urllib.request.urlopen(f"{QB_API}{path}", timeout=5)
+        return json.loads(resp.read().decode())
     except Exception:
-        return 0
+        return None
+
+
+# Track seen ticket IDs to avoid duplicate notifications
+_seen_blocked = set()
 
 
 def classify_event(action, detail):
@@ -331,8 +348,11 @@ class PingleWatcher:
     def __init__(self, app, once=False):
         self.app = app
         self.once = once
-        self.last_seen_id = get_max_activity_id()
-        log(f"Watcher started. last_seen_id={self.last_seen_id}")
+        # Seed seen set with currently blocked tickets so we don't fire on startup
+        tickets = api_get("/api/tickets?project=pings&status=blocked") or []
+        for t in tickets:
+            _seen_blocked.add(t["id"])
+        log(f"Watcher started. {len(_seen_blocked)} existing blocked tickets.")
 
         if not once:
             self.timer = QTimer()
@@ -343,35 +363,18 @@ class PingleWatcher:
 
     def poll(self):
         try:
-            db = get_db()
-            pings_id = get_pings_project_id(db)
-            if pings_id is None:
-                db.close()
+            tickets = api_get("/api/tickets?project=pings&status=blocked")
+            if tickets is None:
                 return
 
-            rows = db.execute("""
-                SELECT a.id, a.ticket_id, a.action, a.detail, t.title
-                FROM activity_log a
-                JOIN tickets t ON t.id = a.ticket_id
-                WHERE a.id > ?
-                  AND t.project_id = ?
-                  AND a.action = 'status'
-                  AND a.detail LIKE '%-> blocked%'
-                ORDER BY a.id
-            """, (self.last_seen_id, pings_id)).fetchall()
+            for t in tickets:
+                if t["id"] not in _seen_blocked:
+                    _seen_blocked.add(t["id"])
+                    action_text = "Blocked"
+                    action_color = "#a05a3a"
+                    log(f"Ping: #{t['id']} {t['title']} [{action_text}]")
+                    PingleNotification.send(t["id"], t["title"], action_text, action_color)
 
-            seen_tickets = set()
-            for r in rows:
-                self.last_seen_id = r["id"]
-                if r["ticket_id"] in seen_tickets:
-                    continue
-                seen_tickets.add(r["ticket_id"])
-
-                action_text, action_color = classify_event(r["action"], r["detail"])
-                log(f"Ping: #{r['ticket_id']} {r['title']} [{action_text}]")
-                PingleNotification.send(r["ticket_id"], r["title"], action_text, action_color)
-
-            db.close()
         except Exception as e:
             log(f"Poll error: {e}")
 
