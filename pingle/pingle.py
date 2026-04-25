@@ -355,7 +355,8 @@ class PingleWatcher:
                 JOIN tickets t ON t.id = a.ticket_id
                 WHERE a.id > ?
                   AND t.project_id = ?
-                  AND a.action IN ('created', 'status')
+                  AND a.action = 'status'
+                  AND a.detail LIKE '%-> blocked%'
                 ORDER BY a.id
             """, (self.last_seen_id, pings_id)).fetchall()
 
